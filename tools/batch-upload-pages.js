@@ -3,10 +3,11 @@
 const fs = require('fs');
 const path = require('path');
 const { ProgressTracker, UploadLog } = require('../lib/progress-tracker');
-const { loadPagesFromDirectory, loadPagesFromManifest } = require('../lib/page-source-loader');
+const { loadPagesFromDirectory, loadPagesFromManifest, loadPagesByRelativePaths, loadChangedFilesList } = require('../lib/page-source-loader');
 const { normalizePageTitle } = require('../lib/page-title-utils');
 const { decidePageAction, buildDryRunEvent } = require('../lib/page-upload-runner');
 const { loginWithDiagnostics } = require('../lib/wiki-login');
+const { loadPageMapping, findWikiPathsByJsonPaths } = require('../lib/page-mapping-loader');
 
 function parseArgs(args) {
   const options = {
@@ -23,6 +24,7 @@ function parseArgs(args) {
     concurrency: null,
     extensions: null,
     file: null,
+    updateOnly: false,
     help: false
   };
 
@@ -92,6 +94,9 @@ function parseArgs(args) {
       case '--skip-existing':
         options.skipExisting = true;
         break;
+      case '--update-only':
+        options.updateOnly = true;
+        break;
       case '-h':
       case '--help':
         options.help = true;
@@ -107,8 +112,8 @@ function validateInputMode(options) {
     throw new Error('source 和 manifest 参数不能同时使用');
   }
 
-  if (!options.source && !options.manifest && !options.resume && !options.retryFailed && !options.file) {
-    throw new Error('需要提供 source、manifest 或 file 参数');
+  if (!options.source && !options.manifest && !options.resume && !options.retryFailed && !options.file && !options.updateOnly) {
+    throw new Error('需要提供 source、manifest、file 或 update-only 参数');
   }
 }
 
@@ -192,11 +197,13 @@ function printHelp() {
   --extensions <列表>          目录模式的文件扩展名，逗号分隔
   --file <文件夹>             只上传指定文件夹的文件（需要配置rootPath）
   -f <文件夹>                --file 的简写形式
+  --update-only              只上传 replace-logs.json 中记录的已更改文件（需要配置rootPath）
   -h, --help                 显示帮助信息
 
 说明:
   如果配置了 rootPath，可以省略 --source 参数。
   使用 --file 可以只上传指定文件夹的文件。如果文件夹不存在，会报错。
+  使用 --update-only 可以只上传 replace-logs.json 中记录的已更改文件。
   默认行为是覆盖已存在的页面。如需跳过，使用 --skip-existing 参数。
 `);
 }
@@ -349,6 +356,34 @@ async function uploadSinglePage(wiki, item, options, summary) {
   }
 }
 
+async function purgePages(wiki, pageTitles) {
+  if (!pageTitles || pageTitles.length === 0) {
+    return { success: true, purged: 0 };
+  }
+
+  const now = new Date().toLocaleTimeString();
+  console.log(`[${now}] 正在刷新页面缓存...`);
+  
+  try {
+    const result = await wiki.purgePage(pageTitles);
+    
+    if (result.error) {
+      return { 
+        success: false, 
+        error: `${result.error.code}: ${result.error.info}`,
+        purged: 0 
+      };
+    }
+
+    console.log(`[${now}] ✓ 成功刷新 ${pageTitles.length} 个页面`);
+    return { success: true, purged: pageTitles.length };
+  } catch (error) {
+    const errorMessage = String(error.message || error);
+    console.log(`[${now}] ✗ 刷新失败: ${errorMessage}`);
+    return { success: false, error: errorMessage, purged: 0 };
+  }
+}
+
 function createItemMap(items) {
   const map = new Map();
   for (const item of items) {
@@ -370,6 +405,10 @@ async function processPageQueue(wiki, items, config, tracker, uploadLog, options
   // 收集所有失败和被跳过的文件信息（除了"已存在"的跳过情况
   const failedFiles = [];
   const skippedFiles = [];
+  // 收集成功上传的页面标题，用于后续刷新
+  const uploadedPages = [];
+  // 收集成功上传的 JSON 文件相对路径，用于查找映射
+  const uploadedJsonPaths = [];
 
   async function worker() {
     while (true) {
@@ -404,6 +443,10 @@ async function processPageQueue(wiki, items, config, tracker, uploadLog, options
           }
           tracker.markCompleted(itemId);
           completed++;
+          // dry-run 模式下也收集 JSON 路径，用于预览将刷新的 wiki 页面
+          if (item.relativePath && item.relativePath.toLowerCase().endsWith('.json')) {
+            uploadedJsonPaths.push(item.relativePath);
+          }
           continue;
         }
 
@@ -417,6 +460,11 @@ async function processPageQueue(wiki, items, config, tracker, uploadLog, options
             onProgress({ type: 'success', file: normalizedTitle });
           }
           completed++;
+          uploadedPages.push(normalizedTitle);
+          // 如果是 JSON 文件上传，记录相对路径用于查找映射
+          if (item.relativePath && item.relativePath.toLowerCase().endsWith('.json')) {
+            uploadedJsonPaths.push(item.relativePath);
+          }
         }
 
         tracker.markCompleted(itemId);
@@ -457,16 +505,182 @@ async function processPageQueue(wiki, items, config, tracker, uploadLog, options
   const workerCount = Math.max(1, concurrency || 1);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
-  return { 
-    completed, 
-    failed, 
-    skipped, 
+  return {
+    completed,
+    failed,
+    skipped,
     failedFiles,
-    skippedFiles
+    skippedFiles,
+    uploadedPages,
+    uploadedJsonPaths
   };
 }
 
+/**
+ * 在 JSON 文件上传完成后，根据 json-page.json 映射刷新对应的 wiki 页面
+ * @param {Object} wiki - HuijiWiki 实例（dry-run 时为 null）
+ * @param {Array} uploadedJsonPaths - 已上传的 JSON 文件相对路径列表
+ * @param {Object} jsonConfig - JSON 上传配置
+ * @param {string} jsonConfigPath - JSON 配置文件路径
+ * @param {Object} options - 选项
+ */
+async function refreshWikiPagesAfterJsonUpload(wiki, uploadedJsonPaths, jsonConfig, jsonConfigPath, options = {}) {
+  const { dryRun = false } = options;
+
+  if (!uploadedJsonPaths || uploadedJsonPaths.length === 0) {
+    return;
+  }
+
+  const pageUploadConfig = jsonConfig?.pageUpload;
+  if (!pageUploadConfig?.jsonPageMapping) {
+    return;
+  }
+
+  const rootPath = pageUploadConfig.rootPath;
+  if (!rootPath) {
+    console.log('未配置 rootPath，跳过 wiki 页面刷新。');
+    return;
+  }
+
+  const mappingFilePath = path.isAbsolute(pageUploadConfig.jsonPageMapping)
+    ? pageUploadConfig.jsonPageMapping
+    : path.join(rootPath, pageUploadConfig.jsonPageMapping);
+
+  if (!fs.existsSync(mappingFilePath)) {
+    console.log(`映射文件不存在: ${mappingFilePath}，跳过 wiki 页面刷新。`);
+    return;
+  }
+
+  console.log(`\n========== 开始刷新 wiki 页面 ==========`);
+  console.log(`正在加载映射文件: ${mappingFilePath}`);
+
+  const mapping = loadPageMapping(mappingFilePath);
+  if (mapping.length === 0) {
+    console.log('映射文件为空，跳过 wiki 页面刷新。');
+    return;
+  }
+
+  const wikiPaths = findWikiPathsByJsonPaths(mapping, uploadedJsonPaths);
+  if (wikiPaths.length === 0) {
+    console.log('没有找到与已上传 JSON 文件对应的 wiki 页面。');
+    return;
+  }
+
+  console.log(`找到 ${wikiPaths.length} 个需要刷新的 wiki 页面。`);
+
+  // 加载页面配置以获取页面根路径
+  const pageConfigPath = pageUploadConfig.pageConfigPath
+    ? (path.isAbsolute(pageUploadConfig.pageConfigPath)
+        ? pageUploadConfig.pageConfigPath
+        : path.resolve(pageUploadConfig.pageConfigPath))
+    : path.join(path.dirname(jsonConfigPath), 'upload.config.page.json');
+
+  if (!fs.existsSync(pageConfigPath)) {
+    console.log(`页面配置文件不存在: ${pageConfigPath}，跳过 wiki 页面刷新。`);
+    return;
+  }
+
+  const pageConfig = loadConfig(pageConfigPath);
+  const pageRootPath = pageConfig?.pageUpload?.rootPath;
+  if (!pageRootPath || !fs.existsSync(pageRootPath)) {
+    console.log('页面根路径未配置或不存在，跳过 wiki 页面刷新。');
+    return;
+  }
+
+  // 加载对应的 wiki 页面文件
+  const refreshItems = loadPagesByRelativePaths(pageRootPath, wikiPaths, {
+    enableParentPage: pageConfig?.pageUpload?.enableParentPage ?? true,
+    excludeParentPagePaths: pageConfig?.pageUpload?.excludeParentPagePaths || []
+  });
+
+  if (refreshItems.length === 0) {
+    console.log('没有找到可刷新的 wiki 页面文件。');
+    return;
+  }
+
+  console.log(`成功加载 ${refreshItems.length} 个 wiki 页面文件。`);
+
+  if (dryRun) {
+    console.log('[预览模式] 以下 wiki 页面将被刷新:');
+    for (const item of refreshItems) {
+      console.log(`  • ${item.title} <- ${item.relativePath}`);
+    }
+    return;
+  }
+
+  // 使用单独的进度跟踪器和日志，避免与主上传冲突
+  const refreshTracker = new ProgressTracker('./page-refresh-progress.json');
+  const refreshUploadLog = new UploadLog('./logs/page-refresh.log');
+  refreshTracker.init(pageRootPath, refreshItems.map(item => item.itemId), {
+    taskType: 'page-refresh',
+    sourceType: 'directory'
+  });
+
+  const refreshResult = await processPageQueue(wiki, refreshItems, pageConfig, refreshTracker, refreshUploadLog, {
+    concurrency: pageConfig?.pageUpload?.maxConcurrency || 1,
+    dryRun: false,
+    overwrite: true,
+    onProgress: printProgress
+  });
+
+  console.log('\n========== wiki 页面刷新完成 ==========');
+  console.log(`完成: ${refreshResult.completed}`);
+  console.log(`跳过: ${refreshResult.skipped}`);
+  console.log(`失败: ${refreshResult.failed}`);
+
+  // 刷新成功上传的页面缓存
+  if (refreshResult.uploadedPages && refreshResult.uploadedPages.length > 0) {
+    await purgePages(wiki, refreshResult.uploadedPages);
+  }
+
+  // 报告刷新中的错误
+  if (refreshResult.failedFiles && refreshResult.failedFiles.length > 0) {
+    console.log(`\n⚠️  刷新失败的页面 (${refreshResult.failedFiles.length}):`);
+    for (const file of refreshResult.failedFiles) {
+      console.log(`  • ${file.title}: ${file.error}`);
+    }
+  }
+}
+
 function loadItemsForNewTask(options, config) {
+  // update-only 模式：只上传 replace-logs.json 中记录的已更改文件
+  if (options.updateOnly) {
+    const rootPath = config?.pageUpload?.rootPath;
+    if (!rootPath || !fs.existsSync(rootPath)) {
+      throw new Error(`根路径未配置或不存在。无法使用 --update-only 参数。`);
+    }
+
+    const changedResult = loadChangedFilesList(rootPath);
+    if (changedResult === null) {
+      throw new Error(`在 ${rootPath} 中未找到 replace-logs.json 文件。--update-only 模式需要此文件。`);
+    }
+
+    const { files: changedFiles, log: changeLog } = changedResult;
+
+    if (changedFiles.length === 0) {
+      console.log('[update-only 模式] replace-logs.json 中没有记录已更改的文件。');
+      return { items: [], sourceDir: rootPath, metadata: { taskType: 'page', sourceType: 'directory' } };
+    }
+
+    const generatedAt = changeLog.generatedAt || '未知时间';
+    const inputCommit = changeLog.inputCommit || '未知';
+    console.log(`[update-only 模式] 从 replace-logs.json 加载了 ${changedFiles.length} 个已更改文件`);
+    console.log(`  生成时间: ${generatedAt}`);
+    console.log(`  输入提交: ${inputCommit}`);
+
+    return {
+      items: loadPagesByRelativePaths(rootPath, changedFiles, {
+        enableParentPage: config?.pageUpload?.enableParentPage ?? true,
+        excludeParentPagePaths: config?.pageUpload?.excludeParentPagePaths || []
+      }),
+      sourceDir: rootPath,
+      metadata: {
+        taskType: 'page',
+        sourceType: 'directory'
+      }
+    };
+  }
+
   let actualSource = resolveSourcePath(options, config);
   
   if (actualSource) {
@@ -515,7 +729,7 @@ async function main() {
 
   const config = loadConfig(options.config);
   
-  if (!options.source && !options.manifest && !options.resume && !options.retryFailed) {
+  if (!options.source && !options.manifest && !options.resume && !options.retryFailed && !options.updateOnly) {
     options.source = resolveSourcePath(options, config);
   }
   
@@ -631,7 +845,17 @@ async function main() {
   console.log(`跳过: ${result.skipped}`);
   console.log(`失败: ${result.failed}`);
   
-  const hasErrors = (result.failedFiles && result.failedFiles.length > 0) || 
+  // 刷新成功上传的页面缓存
+  if (!options.dryRun && result.uploadedPages && result.uploadedPages.length > 0) {
+    await purgePages(wiki, result.uploadedPages);
+  }
+
+  // 如果上传的是 JSON 文件，根据映射刷新对应的 wiki 页面
+  await refreshWikiPagesAfterJsonUpload(wiki, result.uploadedJsonPaths, config, options.config, {
+    dryRun: options.dryRun
+  });
+
+  const hasErrors = (result.failedFiles && result.failedFiles.length > 0) ||
                     (result.skippedFiles && result.skippedFiles.length > 0);
   
   if (!hasErrors) {

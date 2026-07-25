@@ -15,6 +15,8 @@
     "get:page:dry-run": "node tools/batch-upload-pages.js --config ./config/upload.config.page.json --dry-run",
     "get:json": "node tools/batch-upload-pages.js --config ./config/upload.config.output.json",
     "get:json:dry-run": "node tools/batch-upload-pages.js --config ./config/upload.config.output.json --dry-run",
+    "get:json:update": "node tools/batch-upload-pages.js --config ./config/upload.config.output.json --update-only",
+    "get:json:update:dry-run": "node tools/batch-upload-pages.js --config ./config/upload.config.output.json --update-only --dry-run",
     "test": "node --test"
   },
   "dependencies": {
